@@ -138,6 +138,7 @@ docs/魅族16th死屏60fps修复_完整技术文档.md   ← 14 章完整技术�
 docs/尝试追踪链.md                            ← 43 节逐版本调试史（V3~V53）
 docs/目录结构说明.md
 patch/patch_v38.py                            ← 早期补丁生成脚本（历史参考）
+scripts/fpslog.sh                              ← 可选：死屏调试日志工具（抓停滞现场）
 images/boot_v53.img                           ← ★ 最终可刷镜像
 images/Image_v53.img                          ← 最终内核 Image
 ```
