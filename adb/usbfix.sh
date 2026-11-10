@@ -9,7 +9,7 @@
 #
 # 【审核要点】本脚本只做两件事，且都有严格前置条件与限流：
 #   A. adbd 确实在跑 + 确实有 ffs 端点 + ffs.ready=0  → 补 ffs.ready=1
-#   B. 上面修完 UDC 仍为空 + configfs=1                → 推一次 sys.usb.config mtp,diag,adb
+#   B. 上面修完 UDC 仍为空 + configfs=1                → 直接重建 gadget（链接 ffs.adb）
 #   * adbd=stopping 时【什么都不做】（卡 D 状态，推了只会更糟）
 #   * 两次动作之间至少间隔 30 秒
 #   * 不发 keyevent、不碰分区
@@ -62,8 +62,23 @@ fix_once() {
   if ! udc_attached; then
     if too_soon; then return 0; fi
     if [ "$cfgs" != "1" ]; then return 0; fi
-    log "B: UDC empty (state=$state configfs=$cfgs) -> set sys.usb.config mtp,diag,adb"
-    setprop sys.usb.config mtp,diag,adb
+    log "B: UDC empty (state=$state configfs=$cfgs) -> rebuild gadget ffs.adb"
+    GB=/config/usb_gadget/g1
+    gudc=$(ls /sys/class/udc 2>/dev/null | head -1)
+    if [ -n "$gudc" ] && [ -d "$GB" ]; then
+      echo "" > "$GB/UDC" 2>/dev/null
+      sleep 1
+      rm -f "$GB/configs/b.1/f1" "$GB/configs/b.1/f2" "$GB/configs/b.1/f3" 2>/dev/null
+      ln -s "$GB/functions/ffs.adb" "$GB/configs/b.1/f1" 2>/dev/null
+      echo 0x2a45 > "$GB/idVendor" 2>/dev/null
+      echo 0x0c01 > "$GB/idProduct" 2>/dev/null
+      setprop sys.usb.ffs.ready 1
+      sleep 1
+      echo "$gudc" > "$GB/UDC" 2>/dev/null
+      log "B: rebuilt f1=$(readlink $GB/configs/b.1/f1 2>/dev/null) udc=$(cat $GB/UDC 2>/dev/null)"
+    else
+      log "B: no UDC/no gadget -> skip (never touch sys.usb.config)"
+    fi
     mark
     sleep 2
   fi
