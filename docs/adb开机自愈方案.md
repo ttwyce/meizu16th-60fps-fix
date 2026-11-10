@@ -323,3 +323,152 @@ usb.state   = adb
 trigger     = /system/etc/init/zz-adbfix.rc
 logic       = 5228B
 ```
+---
+
+## 九、★ 深挖：USB adb 为什么会失效（2026-11-10 晚）
+
+> 这是本方案最隐蔽的一个坑，症状是：**无线 adb 正常，USB adb 却没有**。
+
+### 9.1 症状
+
+```
+adb devices  →  只有 192.168.31.212:5555 device，没有 USB 序列号
+设备端 adbd 进程健康（持有 /dev/usb-ffs/adb/ep0,ep1,ep2）
+设备端 sys.usb.config / sys.usb.state 都写着 "adb"
+但 Windows 只认到 WPD「16th」（MTP），没有 ADB 接口
+```
+
+### 9.2 真正的机制：`adb` 配置规则是"半残"的
+
+配置文件 `/vendor/etc/init/hw/init.msm.usb.configfs.rc` 里有**两类**规则。
+
+**A 类 —— 真正构建 gadget**（条件含 `sys.usb.ffs.ready=1`），例如 `mtp,diag,adb`：
+
+```
+on property:sys.usb.ffs.ready=1 && property:sys.usb.config=mtp,diag,adb && property:sys.usb.configfs=1
+    write .../configs/b.1/strings/0x409/configuration "mtp_diag_adb"
+    rm .../configs/b.1/f1  ...  f9          ← 先清空所有功能
+    write .../idVendor  0x05C6
+    write .../idProduct 0x903A
+    symlink .../functions/mtp.gs0   .../f1
+    symlink .../functions/diag.diag .../f2
+    symlink .../functions/ffs.adb   .../f3   ← 关键：ADB 功能
+    write .../UDC ${sys.usb.controller}
+    setprop sys.usb.state ${sys.usb.config}
+```
+
+**B 类 —— 只改 VID/PID，什么都不构建**（第 1034、1043 行）：
+
+```
+on property:sys.usb.config=adb && property:sys.usb.configfs=1
+    write .../idVendor  0x2A45
+    write .../idProduct 0x0C01
+    ← 到此结束：不清空 f1~f9、不 symlink ffs.adb、不写 UDC、不设 state
+
+on property:sys.usb.config=mtp,adb && property:sys.usb.configfs=1
+    write .../idVendor  0x2A45
+    write .../idProduct 0x0C02
+    ← 同样只有两行
+```
+
+**关键事实**：把全系统 rc 里所有 `symlink .../functions/ffs.adb` 都列出来（共 24 处），
+**没有任何一处属于 `adb` 或 `mtp,adb`**。它们都属于 `mtp,diag,adb`、`diag,adb`、
+`ccid,adb`、`mass_storage,adb`、`rndis,...` 等组合。
+
+### 9.3 于是失效是这样发生的
+
+```
+setprop sys.usb.config adb
+   ↓
+只触发 B 类规则 → idProduct 变成 0x0C01（对外"声称"是 adb）
+   ↓
+但 B 类规则不清空 f1~f9
+   ↓
+如果之前残留着 mtp.gs0（例如刚用过 MTP），它就留在 f1
+   ↓
+最终描述符 = PID 0x0C01 + MTP 接口，没有 ADB 接口
+   ↓
+主机看不到 adb；而 adbd 进程仍健康，端点也在
+```
+
+**这就是"看起来一切正常、但 USB adb 就是不通"的原因。**
+
+### 9.4 为什么冷启动有时能通、热重启不通
+
+- **干净冷启动**：gadget 从零构建，框架/HAL 会把 `f1` 正确设成 `ffs.adb` → adb 可用
+- **热重启后**：gadget 里可能残留上次的 `mtp.gs0`，此时再 `setprop sys.usb.config adb`
+  只改 PID 不清功能 → 变成"声称 adb、实际 MTP" → adb 失效
+
+### 9.5 修复：改用带完整构建规则的组合
+
+`mtp,diag,adb` 是**唯一同时含 MTP 和 ADB、且有完整 A 类规则**的组合：
+
+```
+setprop sys.usb.ffs.ready 1
+setprop sys.usb.config mtp,diag,adb
+   ↓
+rm f1..f9 → symlink mtp.gs0/ diag.diag / ffs.adb → 写 UDC
+   ↓
+VID/PID = 0x05C6 / 0x903A，配置名 mtp_diag_adb
+   ↓
+Windows 同时认到三个接口：
+  MI_00  WPD「16th」                      (MTP)
+  MI_01  Qualcomm HS-USB Diagnostics 903A (COM3, diag)
+  MI_02  Android Composite ADB Interface   (ADB)
+```
+
+已把两个脚本里的裸 `adb` 全部改为 `mtp,diag,adb`：
+
+| 文件 | 行 | 原值 | 现值 |
+|---|---|---|---|
+| `/data/local/adbfix.sh` | 107 | `setprop sys.usb.config adb` | `setprop sys.usb.config mtp,diag,adb` |
+| `/data/local/usbfix.sh` | 66 | `setprop sys.usb.config adb` | `setprop sys.usb.config mtp,diag,adb` |
+
+备份：`/sdcard/adbfix_backup/adbfix_v18_before_usbfix.sh`、`usbfix_v2_before_usbfix.sh`
+
+### 9.6 附带发现：MTP 控制打不开
+
+实测热重启后框架日志：
+
+```
+UsbDeviceManager: Failed to open control for mtp
+UsbDeviceManager: Failed to open control for ptp
+UsbDeviceManager: Setting USB config to adb
+```
+
+MTP/PTP 的 HAL 控制端打开失败，框架因此退回 `adb` 单功能配置。
+结果是 **ADB 可用、MTP 不可用**（Windows 里看不到 WPD 设备）。
+
+> 若需要 MTP，可手动 `setprop sys.usb.config mtp,diag,adb`
+> （该组合会强制清空并重建 gadget，三者同时具备）。
+
+### 9.7 排查命令速查
+
+```bash
+# 1) 看属性（注意：属性可能与实际不一致，必须看 gadget）
+adb shell 'getprop sys.usb.config; getprop sys.usb.state'
+
+# 2) 看 gadget 真实内容（权威）
+adb shell 'ls -l /config/usb_gadget/g1/configs/b.1/ | grep "^l"'
+#   期望看到 ffs.adb 的 symlink；若只有 mtp.gs0 → ADB 接口不存在
+
+# 3) 看 VID/PID 判断走了哪条规则
+adb shell 'cat /config/usb_gadget/g1/idVendor; cat /config/usb_gadget/g1/idProduct'
+#   0x2A45/0x0C01 = adb 的 B 类规则（危险，不清功能）
+#   0x2A45/0x0C02 = mtp,adb 的 B 类规则（同样危险）
+#   0x05C6/0x903A = mtp,diag,adb 的 A 类规则（完整重建，安全）
+
+# 4) 看 UDC 是否绑定
+adb shell 'cat /config/usb_gadget/g1/UDC; cat /sys/class/udc/*/state'
+#   应为 a600000.dwc3 且 state=configured
+```
+
+### 9.8 教训
+
+1. **不要相信 `sys.usb.config` / `sys.usb.state` 属性**——它们可能只反映"想配什么"，
+   不反映 gadget 里"实际有什么"。**权威来源永远是 configfs 里的 symlink。**
+2. **改 USB 配置前先看该配置有没有"完整构建规则"**。
+   只有"设 VID/PID"两行的配置（`adb`、`mtp,adb`）依赖 gadget 已有正确功能，
+   在残留状态下会把 USB 弄坏。
+3. **热重启和冷启动的 USB 初始化路径不同**。热重启会保留 gadget 状态，
+   冷启动从零开始。这类差异要单独测。
