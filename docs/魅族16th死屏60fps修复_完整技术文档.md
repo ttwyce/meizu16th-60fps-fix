@@ -628,3 +628,90 @@ struct msm_display_info {
 ---
 
 **文档结束**
+---
+
+## 11. 后续迭代：从 V38 到 V43（2026-11-10 下午）
+
+> 本章记录 V38 之后针对"停止再滑动卡顿 / 浏览器 0fps"的继续排查。
+> **最终定版：V43**（md5 `d03680624bcbb14f755317a15d907156`）。
+
+### 11.1 V38 的遗留问题
+
+用户反馈"一直滑动不卡，停止滑动再滑动时会卡"。100ms 细采样定位：
+
+```
+静止时 SF 释放 vblank 引用 → 驱动注销 RDPTR 中断 → 看门狗 vsync 停摆
+恢复滑动需重新注册 → 100~200ms 空档 → 第一帧出不来
+```
+
+实测：静止 10~20s 后恢复滑动，前 300ms 仅 20~28fps（V38）。
+
+### 11.2 失败尝试（都查清了原因，非瞎试）
+
+| 版本 | 改动 | 结果 | 根因 |
+|---|---|---|---|
+| **V39** | 递减 `pending_ctlstart_cnt`（0x28C） | 约 8 分钟后 **GPU 死锁** | 在 0ms 伪造"帧已开始"，硬件未动 → display buffer use-after-free → SF 卡在 `adreno_drawctxt_wait` |
+| **V40** | 驱动层 no-op `unregister_irq(RDPTR)` | **黑屏 0fps** | 只改驱动层，DRM 核心层仍置 `vblank_enable=0`，状态不一致 |
+| **V41** | DRM 层 `vblank_disable_fn` 永不关闭 | 开始流畅，约 9 分钟后 **0fps** | vblank 常开 → SF 持续提交 → ctl_start 超时 → commit 失败 → `retire event overflow`（槽耗尽） |
+| **V42** | V41 + ctl_start 超时 `ret=0` | 桌面 5 分钟 60fps，但**打开浏览器 GPU 死锁** | 超时路径与代码洞**双重 signal retire fence** → fence 序号错位 → GPU syncpoint deadlock |
+
+V42 死锁的决定性证据：
+```
+kgsl: possible gpu syncpoint deadlock
+context[2] pending events: [0] FENCE sde_fence:conn26:39654
+plane92 9999ms timeout on kgsl-timeline
+```
+
+### 11.3 V43 最终定版
+
+**V43 = V38 + 仅 ctl_start 超时 `ret=0`（撤销 vblank 常开）**
+
+```
+0x56AE64: 12800DB4 (movn w20,#0x6d = -110)  →  52800014 (movz w20,#0)
+```
+
+原理：`wait_for_ctl_start` 超时后驱动本来就有降级处理（signal retire + 递减 ctlstart），
+但返回 `-ETIMEDOUT` 导致 commit 失败。改成 `ret=0` 后 commit 继续、retire 槽正常释放。
+同时**保留 vblank 正常关闭**（撤销 V41），避免 SF 无限提交导致 GPU 队列堆积。
+
+**与 V39 的本质区别**：V39 在 0ms 伪造成功；V43 等满 84ms 后才放弃，硬件有足够时间，安全。
+
+### 11.4 V43 实测（最终验收）
+
+| 场景 | 结果 |
+|---|---|
+| 桌面持续滑动 5 分钟 | 60 fps |
+| 停止→滑动循环 18 轮 | 61~62 fps |
+| **浏览器（Via）持续滚动** | **53~60 fps**（scrcpy 实测，偶有 29/42/50 波动属正常） |
+| GPU 死锁 / retire overflow / fence 超时 | **全 0** |
+| ctl_start / commit / vblank 错误 | **全 0** |
+
+### 11.5 ⚠️ 测量陷阱（重要教训）
+
+曾误报"浏览器滑动只有 6fps"，**实为测量失效**：
+`input swipe` 报 `INJECT_EVENTS` 权限错误 → 滑动根本没注入 → SF 进 Idle → vsync 停摆。
+
+**正确做法**：
+- 用 `su -c` 执行 input 保证权限
+- 同时记录两个指标：`/sys/kernel/debug/dri/0/encoder25/status` 的 vsync 计数 + scrcpy `--print-fps` 实际编码帧率
+- 报数前先确认 `ps -A | grep surfaceflinger` 线程状态与输入是否真的生效
+
+用户在投屏窗口看到的 30 多 fps 是真实的；错误结论来自测量脚本，不是设备。
+
+### 11.6 当前 V43 完整补丁清单
+
+| # | 地址 | 改动 | 作用 |
+|---|---|---|---|
+| 1 | `0x56A94C` / `0x56A83C` | V20 两点 | 抑制 PANEL_DEAD / 降级 |
+| 2 | `0x55E478` | watchdog vsync | 坏面板 TE → 硬件看门狗定时器 |
+| 3 | `0x566864` + `0x56A0E8` | 代码洞 | `frame_done(0x9)` + 递减 kickoff |
+| 4 | `0x56AE64` | ctl 超时 `ret=0` | commit 不失败，retire 槽不堆积 |
+
+> 不含 V41 的 vblank 常开（`0x51B840` 保持原样 `0x35000120`）。
+
+### 11.7 版本链
+
+```
+V38（恢复卡顿）→ V39（GPU 死锁，废）→ V40（黑屏，废）
+→ V41（0fps 溢出）→ V42（浏览器 GPU 死锁）→ V43（★ 最终定版）
+```
