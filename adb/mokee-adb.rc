@@ -1,0 +1,12 @@
+# adb over network
+on property:adb.network.port=*
+    setprop service.adb.tcp.port ${adb.network.port}
+
+# [adbfix] 关键：原来这里还有 "stop adbd" 再 "start adbd"。
+# adbd 一旦被 stop 就卡在内核 D 状态，init 永远停在 stopping，USB 功能再也注册不回来。
+# 所以只允许 start，不允许 stop。
+on property:service.adb.tcp.port=5555
+    start adbd
+
+on property:service.adb.tcp.port=-1
+    start adbd

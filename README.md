@@ -130,15 +130,63 @@ adb shell 'cat /sys/kernel/debug/dri/0/crtc111/status | grep "vblank fps"'   # 5
 
 ---
 
-## 七、仓库结构
+## 七、ADB 开机自愈（死屏设备必读）
+
+屏幕物理损坏后 **ADB 是唯一交互通道**，所以它的可靠性比什么都重要。
+
+本方案**不依赖 Magisk**，由 init 直接加载：
+
+```
+/system/etc/init/zz-adbfix.rc     ← 触发器（不依赖 Magisk）
+    on property:sys.boot_completed=1   → start adbfix
+    on property:sys.usb.state=mtp      → start adbfix
+    on property:sys.usb.state=mtp,adb  → start adbfix
+        ↓
+/system/etc/adbfix.sh             ← 149 字节外壳，只做 exec
+        ↓
+/data/local/adbfix.sh             ← 真正的逻辑（v18，改它不用动 /system）
+        ↓
+/data/local/usbfix.sh --watch     ← USB gadget 自愈
+```
+
+**为什么不用 Magisk 模块**：Magisk 有 bootloop 保护，检测到开机循环会自动禁用
+"可疑模块" —— 正好可能把救命的 adb 通道一起关掉。而 init rc 独立于 Magisk，
+即使 Magisk 完全失效，adb 仍能起来。
+
+**快速自检**：
+
+```bash
+adb shell '
+  echo "usb.config = $(getprop persist.sys.usb.config)"   # 应为 adb
+  echo "adb_enabled = $(settings get global adb_enabled)" # 应为 1
+  echo "adbd        = $(getprop init.svc.adbd)"           # 应为 running
+  echo "usb.state   = $(getprop sys.usb.state)"           # 应为 adb
+'
+```
+
+**adb 掉了怎么办**：见 `docs/adb开机自愈方案.md` 第六节「故障排查手册」，
+脚本原件在 `adb/` 目录，可直接还原。
+
+> ⚠️ 切勿执行 `stop adbd` —— adbd 会卡在内核 D 状态，init 永久停在 `stopping`，
+> 只能重启恢复。`mokee-adb.rc` 已限制为"只 start 不 stop"。
+
+---
+
+## 八、仓库结构
 
 ```
 README.md
 docs/魅族16th死屏60fps修复_完整技术文档.md   ← 14 章完整技术文档（含排错附录）
 docs/尝试追踪链.md                            ← 43 节逐版本调试史（V3~V53）
 docs/目录结构说明.md
+docs/adb开机自愈方案.md                       ← ADB 开机自愈方案（触发器/脚本/排错）
 patch/patch_v38.py                            ← 早期补丁生成脚本（历史参考）
 scripts/fpslog.sh                              ← 可选：死屏调试日志工具（抓停滞现场）
+adb/zz-adbfix.rc                            ← init 触发器（三个触发条件）
+adb/mokee-adb.rc                            ← 无线 adb 规则（只 start 不 stop）
+adb/system_adbfix_wrapper.sh                  ← /system/etc/adbfix.sh 壳
+adb/adbfix.sh                               ← 主逻辑 v18（/data/local/）
+adb/usbfix.sh                              ← USB gadget 自愈（/data/local/）
 images/boot_v53.img                           ← ★ 最终可刷镜像
 images/Image_v53.img                          ← 最终内核 Image
 ```
@@ -147,7 +195,7 @@ images/Image_v53.img                          ← 最终内核 Image
 
 #---
 
-## 八、常见问题
+## 九、常见问题
 
 ### Q1. 浏览器能上网但打不开网页 / 直接闪退
 
@@ -180,7 +228,7 @@ debugfs 根目录权限重置为内核默认的 `0700`。随后 zygote fork WebV
 无 GUI 时可截图做颜色统计：整屏纯白占比 >90%、颜色种类 <200 基本可断定没渲染出来；
 正常网页通常 >500 种颜色。
 
-# 九、免责声明
+## 十、免责声明
 
 - 仅针对**屏幕已物理损坏**、已解锁引导、已 root 的设备。正常设备无需也无益。
 - 刷写 boot 分区有风险，请先备份原厂 `boot.img` / `dtbo`，确认能进 TWRP。

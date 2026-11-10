@@ -1,0 +1,15 @@
+service adbfix /system/bin/sh /system/etc/adbfix.sh
+    class main
+    user root
+    group root system shell
+    oneshot
+    disabled
+
+on property:sys.usb.state=mtp
+    start adbfix
+
+on property:sys.usb.state=mtp,adb
+    start adbfix
+
+on property:sys.boot_completed=1
+    start adbfix
