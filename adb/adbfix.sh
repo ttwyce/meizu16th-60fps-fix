@@ -86,9 +86,25 @@ else
   log "adb_enabled already 1"
 fi
 
-# 等 adbd 起来（最多 90s，不干预）
+# ---- 5.5) 无线 adb ----
+# 关键：adbd 监听 0.0.0.0:5555 不需要 wlan0 有 IP，
+# 所以立刻设置，不要等 WiFi 拿地址（之前等 30s 是启动慢的原因之一）。
+wport=$(getprop persist.adb.tcp.port)
+if [ -n "$wport" ] && [ "$wport" != "0" ]; then
+  if [ "$(getprop service.adb.tcp.port)" != "$wport" ]; then
+    log "wifi adb: set service.adb.tcp.port=$wport"
+    setprop service.adb.tcp.port "$wport"
+    sleep 2
+  else
+    log "wifi adb: tcp port already $wport"
+  fi
+  wip=$(ip -4 addr show wlan0 2>/dev/null | grep -oE 'inet [0-9.]+' | head -1 | awk '{print $2}')
+  log "wifi adb ready: ${wip:-<wlan0无IP>}:$wport"
+fi
+
+# 等 adbd 起来（最多 20s，不干预）
 n=0
-while [ $n -lt 45 ]; do
+while [ $n -lt 10 ]; do
   if [ "$(getprop init.svc.adbd)" = "running" ]; then
     log "adbd running after $((n*2))s, usb=$(getprop sys.usb.state)"
     break
@@ -96,17 +112,65 @@ while [ $n -lt 45 ]; do
   sleep 2; n=$((n+1))
 done
 
-# 只有满足【全部】条件才做一次 configfs 推进，且只做一次：
-#   adbd 仍未 running  且  configfs=1  且  adbd 不是 stopping（stopping 说明卡死了，推也没用，别动）
-if [ "$(getprop init.svc.adbd)" != "running" ] \
-   && [ "$(getprop sys.usb.configfs)" = "1" ] \
-   && [ "$(getprop init.svc.adbd)" != "stopping" ]; then
-  log "adbd not running (not stopping) -> one-shot configfs nudge"
+# ---- 4.5) USB gadget 修复 ----
+# 魅族 init.msm.usb.configfs.rc 里 sys.usb.config=adb 属于 "B-class" 规则：
+#   只写 idVendor/idProduct，【不清空功能、不链接 ffs.adb、不动 UDC】。
+# 结果 configs/b.1/f1 还停在 mtp.gs0，adbd 的 ffs 端点没进 USB 配置，
+# 主机永远看不到 ADB 设备。这里直接操作 configfs 重建。
+GB=/config/usb_gadget/g1
+
+gadget_ok() {
+  [ -L "$GB/configs/b.1/f1" ] || return 1
+  case "$(readlink "$GB/configs/b.1/f1" 2>/dev/null)" in
+    *functions/ffs.adb) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+fix_gadget() {
+  [ "$(getprop sys.usb.configfs)" = "1" ] || { log "gadget: configfs!=1, skip"; return 1; }
+  [ -d "$GB" ] || { log "gadget: no $GB, skip"; return 1; }
+  gudc=$(ls /sys/class/udc 2>/dev/null | head -1)
+  [ -n "$gudc" ] || { log "gadget: no UDC, skip"; return 1; }
+  log "gadget: rebuild f1->ffs.adb on $gudc"
+  echo "" > "$GB/UDC" 2>/dev/null
+  sleep 1
+  rm -f "$GB/configs/b.1/f1" "$GB/configs/b.1/f2" "$GB/configs/b.1/f3" 2>/dev/null
+  ln -s "$GB/functions/ffs.adb" "$GB/configs/b.1/f1" 2>/dev/null
+  echo 0x2a45 > "$GB/idVendor" 2>/dev/null
+  echo 0x0c01 > "$GB/idProduct" 2>/dev/null
   setprop sys.usb.ffs.ready 1
   sleep 1
-  setprop sys.usb.config mtp,diag,adb
-  sleep 4
-  log "after nudge: adbd=$(getprop init.svc.adbd) usb=$(getprop sys.usb.state)"
+  echo "$gudc" > "$GB/UDC" 2>/dev/null
+  sleep 2
+  log "gadget: f1=$(readlink $GB/configs/b.1/f1 2>/dev/null) udc=$(cat $GB/UDC 2>/dev/null)"
+}
+
+adbd_now=$(getprop init.svc.adbd)
+if [ "$adbd_now" = "running" ]; then
+  if gadget_ok; then
+    log "gadget ok (f1=ffs.adb)"
+  else
+    fix_gadget
+  fi
+elif [ "$adbd_now" = "stopping" ]; then
+  # 卡死在 stopping：内核层阻塞，本脚本救不了，只能重启。绝不干预。
+  log "adbd WEDGED in 'stopping' -> reboot required, do nothing"
+else
+  # adbd 没在跑。绝对不要动 sys.usb.config —— 那会让 init 重建 USB 配置，
+  # 而 adbd 一旦进入 stopping 就卡死（内核层），只能重启恢复。
+  # 正确做法：只让 init 把 adbd 启起来（ctl.start），adbd 自己会注册 ffs。
+  log "adbd not running -> ctl.start adbd (never touch sys.usb.config)"
+  setprop ctl.start adbd
+  wn=0
+  while [ $wn -lt 15 ]; do
+    [ "$(getprop init.svc.adbd)" = "running" ] && break
+    sleep 1; wn=$((wn+1))
+  done
+  setprop sys.usb.ffs.ready 1
+  sleep 2
+  gadget_ok || fix_gadget
+  log "after start: adbd=$(getprop init.svc.adbd) usb=$(getprop sys.usb.state)"
 fi
 
 # ---- 5) USB 自愈看护（严格条件、限流）----
