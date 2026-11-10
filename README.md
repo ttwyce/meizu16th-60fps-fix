@@ -176,10 +176,10 @@ adb shell '
 
 ```
 README.md
-docs/魅族16th死屏60fps修复_完整技术文档.md   ← 14 章完整技术文档（含排错附录）
-docs/尝试追踪链.md                            ← 43 节逐版本调试史（V3~V53）
+docs/魅族16th死屏60fps修复_完整技术文档.md   ← 15 章完整技术文档（含排错附录）
+docs/尝试追踪链.md                            ← 44 节逐版本调试史（V3~V53）
 docs/目录结构说明.md
-docs/adb开机自愈方案.md                       ← ADB 开机自愈方案（触发器/脚本/排错）
+docs/adb开机自愈方案.md                       ← ADB 开机自愈方案（触发器/脚本/排错/USB根因）
 patch/patch_v38.py                            ← 早期补丁生成脚本（历史参考）
 scripts/fpslog.sh                              ← 可选：死屏调试日志工具（抓停滞现场）
 adb/zz-adbfix.rc                            ← init 触发器（三个触发条件）
@@ -196,6 +196,36 @@ images/Image_v53.img                          ← 最终内核 Image
 #---
 
 ## 九、常见问题
+
+### Q0. 无线 adb 正常，但 USB adb 没有（热重启后尤其常见）
+
+**不是线材/驱动问题。** 先看 gadget 里到底有没有 ADB 功能：
+
+```bash
+adb shell 'ls -l /config/usb_gadget/g1/configs/b.1/ | grep "^l"'
+# 必须看到 .../functions/ffs.adb 的 symlink，否则 ADB 接口根本不存在
+adb shell 'cat /config/usb_gadget/g1/idProduct'
+# 0x0C01 / 0x0C02 = 走了"只改PID不建gadget"的危险规则
+# 0x903A        = mtp,diag,adb 的完整重建规则（安全）
+```
+
+**根因**：ROM 的 `init.msm.usb.configfs.rc` 里，`sys.usb.config=adb` 和 `=mtp,adb`
+两条规则**只写 VID/PID**，不清空 f1~f9、不 symlink `ffs.adb`、不绑 UDC。
+若 gadget 里残留着上次的 `mtp.gs0`，就会得到"PID 声称 adb、实际只有 MTP"的状态 ——
+主机看不到 adb，而 adbd 进程依然健康。
+
+**修复**：用有完整构建规则的组合（会先 `rm f1..f9` 再重建）：
+
+```bash
+adb shell su -c 'setprop sys.usb.ffs.ready 1'
+adb shell su -c 'setprop sys.usb.config mtp,diag,adb'
+```
+
+本仓库 `adb/adbfix.sh` 与 `adb/usbfix.sh` 已改用 `mtp,diag,adb`。
+详见 `docs/adb开机自愈方案.md` 第九章。
+
+> ⚠️ 永远不要用 `sys.usb.config` / `sys.usb.state` 属性判断 USB 是否正常 ——
+> 它们可能只反映"想配什么"。**权威来源是 configfs 里的 symlink。**
 
 ### Q1. 浏览器能上网但打不开网页 / 直接闪退
 
