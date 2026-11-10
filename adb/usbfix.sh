@@ -9,7 +9,7 @@
 #
 # 【审核要点】本脚本只做两件事，且都有严格前置条件与限流：
 #   A. adbd 确实在跑 + 确实有 ffs 端点 + ffs.ready=0  → 补 ffs.ready=1
-#   B. 上面修完 UDC 仍为空 + configfs=1                → 推一次 sys.usb.config adb
+#   B. 上面修完 UDC 仍为空 + configfs=1                → 推一次 sys.usb.config mtp,diag,adb
 #   * adbd=stopping 时【什么都不做】（卡 D 状态，推了只会更糟）
 #   * 两次动作之间至少间隔 30 秒
 #   * 不发 keyevent、不碰分区
@@ -62,8 +62,8 @@ fix_once() {
   if ! udc_attached; then
     if too_soon; then return 0; fi
     if [ "$cfgs" != "1" ]; then return 0; fi
-    log "B: UDC empty (state=$state configfs=$cfgs) -> set sys.usb.config adb"
-    setprop sys.usb.config adb
+    log "B: UDC empty (state=$state configfs=$cfgs) -> set sys.usb.config mtp,diag,adb"
+    setprop sys.usb.config mtp,diag,adb
     mark
     sleep 2
   fi
