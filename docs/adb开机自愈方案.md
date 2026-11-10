@@ -472,3 +472,286 @@ adb shell 'cat /config/usb_gadget/g1/UDC; cat /sys/class/udc/*/state'
    在残留状态下会把 USB 弄坏。
 3. **热重启和冷启动的 USB 初始化路径不同**。热重启会保留 gadget 状态，
    冷启动从零开始。这类差异要单独测。
+
+---
+
+## 十、★ 2026-11-11 夜：USB adb 失效的真正机制与修复
+
+第九章找到了"B 类规则不清功能"的证据，这一章给出**根治方案**：绕过属性，直接操作 configfs。
+
+### 10.1 现象
+
+热重启后：
+
+```
+$ adb devices
+List of devices attached
+（空 —— USB 序列号不见了）
+```
+
+但设备内部属性看着一切正常：
+
+```
+sys.usb.config         = adb
+sys.usb.state          = adb
+sys.usb.configfs       = 1
+sys.usb.ffs.ready      = 1
+UDC                    = a600000.dwc3
+```
+
+**权威来源（configfs）才是真相**：
+
+```
+$ ls -l /config/usb_gadget/g1/configs/b.1/
+lrwxrwxrwx  f1 -> ../../../../usb_gadget/g1/functions/mtp.gs0   ← 不是 ffs.adb！
+```
+
+`idVendor/idProduct = 0x2a45 / 0x0c01`（adb 的 B 类 VID/PID），
+但功能仍然挂着 MTP。**USB 描述符里没有 ADB 接口，adbd 的 ffs 端点根本没接进去。**
+
+### 10.2 为什么 B 类规则必然坏
+
+冷启动时 init 按 `persist.sys.usb.config`（本机为 `none`）或默认值先配成 MTP，
+此时 `f1 -> mtp.gs0`。之后框架把 `sys.usb.config` 设成 `adb`：
+
+| 规则 | 动作 | 结果 |
+|---|---|---|
+| **A 类**（`mtp,diag,adb` 等） | 清空 f1..f9 → 逐个 symlink 功能（含 `ffs.adb`）→ 写 UDC → setprop state | ✅ 完整重建 |
+| **B 类**（`adb`、`mtp,adb`） | **只写 idVendor/idProduct** | ❌ 功能保持原样（还是 mtp） |
+
+所以 `adb` 这条路径**依赖 gadget 已经是正确状态**，一旦有残留（几乎必然有）就坏。
+
+### 10.3 修复：直接重建 gadget
+
+不再依赖属性，直接改 configfs：
+
+```bash
+GB=/config/usb_gadget/g1
+UDC=$(ls /sys/class/udc | head -1)          # a600000.dwc3
+
+echo "" > $GB/UDC                            # 1. 先断开
+sleep 1
+rm -f $GB/configs/b.1/f1 $GB/configs/b.1/f2 $GB/configs/b.1/f3   # 2. 清旧功能
+ln -s $GB/functions/ffs.adb $GB/configs/b.1/f1                  # 3. 链上 ADB
+echo 0x2a45 > $GB/idVendor                                      # 4. adb 的 VID/PID
+echo 0x0c01 > $GB/idProduct
+setprop sys.usb.ffs.ready 1
+sleep 1
+echo "$UDC" > $GB/UDC                        # 5. 重新挂上
+```
+
+### 10.4 实测效果（无需重启）
+
+```
+修复前: f1 -> mtp.gs0        adb devices → 空
+修复后: f1 -> ffs.adb        adb devices → 882QAET72F4YB  device   ← 立即出现
+```
+
+`adbfix.sh` 与 `usbfix.sh` 都已内置这个逻辑（函数 `fix_gadget()` / B 分支重建）。
+
+### 10.5 判定是否健康（唯一可靠方法）
+
+```bash
+adb shell 'readlink /config/usb_gadget/g1/configs/b.1/f1 | sed "s|.*/||"'
+#   ffs.adb   → 正常
+#   mtp.gs0   → USB adb 不存在（不管属性怎么说）
+```
+
+---
+
+## 十一、无线 adb（WiFi adb）
+
+### 11.1 需要两个属性
+
+| 属性 | 作用 | 存放 |
+|---|---|---|
+| `persist.adb.tcp.port` | 持久标记，重启后仍在 | `/data/property/persistent_properties` |
+| `service.adb.tcp.port` | adbd 据此决定是否监听 TCP | 运行时属性 |
+
+开启一次：
+
+```bash
+adb shell 'su -c "setprop persist.adb.tcp.port 5555"'
+adb tcpip 5555                     # 或在 shell 里 setprop service.adb.tcp.port 5555
+adb connect <手机IP>:5555
+```
+
+### 11.2 关键认知：设 TCP 端口 **不需要** 等 WiFi 拿到 IP
+
+adbd 监听的是 `0.0.0.0:5555`，与 `wlan0` 有没有地址无关。
+早期脚本先等 `wlan0` 有 IP（最多 30 秒）再设端口，是纯浪费。
+
+**正确顺序**：开机 → `adb_enabled=1` → 立刻 `setprop service.adb.tcp.port` → adbd 自己绑 5555。
+
+### 11.3 启动慢的真正原因：90 秒死等 adbd
+
+原始 adbfix 在 `boot_completed` 后死等 `init.svc.adbd=running` **最多 90 秒**。
+但 `adb_enabled=0` 时框架根本不会拉起 adbd，于是白等满 90 秒才走到后面的逻辑。
+
+实测日志（修复前）：
+
+```
+17:57:05  adbfix 启动
+17:57:08  adb_enabled 0 -> 1
+17:58:40  ← 中间空了 92 秒
+17:58:46  wifi adb: set service.adb.tcp.port=5555
+```
+
+修复（v20）：把无线 adb 段落提到等待之前，等待 90s→20s。实测（修复后）：
+
+```
+18:01:20  adbfix 启动
+18:01:20  color_profile ok: [1]
+18:01:25  settings 就绪（4s）
+18:01:26  adb_enabled 0 -> 1
+18:01:26  wifi adb: set service.adb.tcp.port=5555     ← 6 秒
+18:01:28  adbd running, f1=ffs.adb（无需重建）
+18:01:28  全部就绪
+```
+
+**从 adbfix 启动到双通道可用：8 秒**（原 92 秒）。
+
+### 11.4 用法
+
+```powershell
+adb connect 192.168.31.212:5555
+scrcpy -s 192.168.31.212:5555
+```
+
+---
+
+## 十二、adbd 进入 `stopping` 的成因与禁令
+
+### 12.1 现象（很危险）
+
+```
+init.svc.adbd = stopping          ← init 认为在停
+ps: adbd --root_seclabel=... S    ← 进程其实还活着
+f1 = 无（被拆掉）
+UDC = 空
+```
+
+此时 USB 和无线都可能失效，**只有重启能恢复**。
+
+### 12.2 实测触发源
+
+| 动作 | 后果 |
+|---|---|
+| `adb shell 'stop adbd'`（init 层） | adbd 卡 D 状态，`mokee-adb.rc` 已删除该逻辑 |
+| `setprop sys.usb.config <任意值>` | init 重建 USB 配置 → adbd 被 stop/start → 本机必卡 |
+| 框架层 `adb_enabled` 0→1 | 会重启 adbd，与上一条叠加即卡死 |
+| `adb_enabled` 1→0→1 快速切换 | 必卡（这是 2026-11-10 我自己踩过的坑） |
+
+### 12.3 三条硬规则（已写进脚本）
+
+1. **绝不 `stop adbd`**，只允许 `start`。
+2. **绝不 `setprop sys.usb.config`** —— v20 起两个脚本里已完全移除，改用 configfs 直接重建。
+3. adbd 没在跑时，只用 **`setprop ctl.start adbd`**，然后用 `fix_gadget()` 补 gadget。
+
+脚本现在的分支：
+
+```sh
+adbd_now=$(getprop init.svc.adbd)
+if [ "$adbd_now" = "running" ]; then
+  gadget_ok || fix_gadget
+elif [ "$adbd_now" = "stopping" ]; then
+  log "adbd WEDGED -> reboot required, do nothing"     # 不干预
+else
+  setprop ctl.start adbd; wait 15s; gadget_ok || fix_gadget
+fi
+```
+
+---
+
+## 十三、GSI 兼容性实测结论（2026-11-10 ~ 11）
+
+### 13.1 三次尝试，三个全败
+
+| GSI | 版本 | 结果 | 卡点 |
+|---|---|---|---|
+| LineageOS 18.1 `arm64_bvS` | Android 11 / API 30 | 失败 | vendor `plat_sepolicy_vers=29.0` 与 API 30 不匹配 → 303 次 `no domain transition`，所有 vendor HAL 被 init 拒绝启动，composer 从未加载 |
+| LineageOS 17.1 `treble_arm64_bvS` | Android 10 / API 29 | 失败 | SELinux permissive 不阻塞，SurfaceFlinger 能起，但 `vendor.hwcomposer-2-1` 每次 `exit(1)` |
+| PHH AOSP v222 `system-quack-arm64-ab` | Android 10 / API 29 | 失败 | 与上条完全相同 |
+
+### 13.2 共同死因
+
+```
+vendor.hwcomposer-2-1 启动后 ~145ms exit(1)
+  → 它的 rc 有 onrestart restart surfaceflinger
+  → 每次 composer 崩，init 就 SIGKILL SurfaceFlinger
+  → SurfaceFlinger 永远起不来
+  → system_server 拿不到合成器 → 不起来
+  → sys.boot_completed 永远 0 → 没有 adbd / USB 不枚举
+  → 设备回落到 TWRP
+```
+
+崩溃服务清单三次完全一致：`vendor.hwcomposer-2-1`、`qdutils_disp-1-0`、
+`display-color-hal-1-0`、`vendor.power-hal-1-2`、`tui_comm-1-0`、`qteeconnector-hal-1-0`。
+
+**结论：魅族 vendor 的 HWC 2.1 实现拒绝在非魅族 system 上加载。**
+换 GSI 版本绕不过去，必须给 vendor 二进制打补丁（数小时逆向工程，未做）。
+
+### 13.3 顺带修好的真 bug：pdx socket 目录缺失
+
+GSI 的 `/system/etc/init/surfaceflinger.rc` 声明了 3 个 socket：
+
+```
+socket pdx/system/vr/display/client   stream 0666 ...
+socket pdx/system/vr/display/manager  stream 0666 ...
+socket pdx/system/vr/display/vsync    stream 0666 ...
+```
+
+但 AOSP init 不会创建中间目录，vendor 侧也没有 `mkdir /dev/socket/pdx/...`，于是：
+
+```
+init: Failed to bind socket 'pdx/system/vr/display/client': No such file or directory
+```
+
+加一个 vendor rc 在 `on early-init` 建目录后，socket 创建成功（日志已验证）：
+
+```
+init: Created socket '/dev/socket/pdx/system/vr/display/client', mode 666, user 1000, group 1003
+```
+
+**但这不是 HWC 崩溃的原因**——修好 pdx 后 composer 仍然 exit(1)。补丁已移除，vendor 恢复原状。
+
+### 13.4 设备分区事实（供后续参考）
+
+```
+vendor   : Android 10 / SDK 29，plat_sepolicy_vers=29.0，非 VNDK vendor（无 ro.vndk.version）
+HAL      : keymaster 3.0、health 2.0、composer 2.1、allocator/mapper 2.0、audio 2.0
+分区     : A-only 单槽位；system=sda16(3GB ext4)、vendor=sda17(1GB ext4)、无 product 分区
+布局     : system-as-root（/init -> /system/bin/init）
+GSI 变体 : 必须选 system-as-root（AndyYan 的 b / PHH 的 ab），aonly 不适用
+```
+
+---
+
+## 十四、`/data` 格式化的连带损失清单
+
+GSI 实验需要清 `/data`，以下全部丢失（2026-11-11 实测）：
+
+| 丢失项 | 说明 | 恢复方式 |
+|---|---|---|
+| `/data/misc/adb/adb_keys` | adb 授权公钥 | 从 `phone-backup\adb_keys` 推回，`chmod 640 chown system:shell` |
+| `/data/local/adbfix.sh` / `usbfix.sh` | adb 自愈脚本本体 | 从 `00_最终成果\adb_files\` 推回 |
+| `/data/property/persistent_properties` | `persist.adb.tcp.port` 等 | 重新 `setprop persist.*` |
+| `/data/adb/magisk/*` | Magisk 运行时 | Magisk 开机自动重建，root 正常 |
+| `/data/adb/modules/*` | Magisk 模块（KPatch-Next、LSPosed 等） | 重新刷入模块 zip |
+| `/data/misc/wifi/WifiConfigStore.xml` | WiFi 密码 | 必须手动重输（无触屏时用 scrcpy） |
+| `/sdcard` 全部内容 | 含 `boot_v53.img`、`part_backup/`、`adb5555.zip` 等 | PC 上有副本 |
+| 系统设置 | 含 `mokee_color_profile` | adbfix 每次开机自动写 `1` |
+
+> ⚠️ `mokee_color_profile` 为空会导致 livedisplay HAL 崩 → watchdog 无限重启。
+> adbfix 第 1 段就是修这个，务必保留在前面。
+
+---
+
+## 十五、版本记录
+
+| 版本 | 日期 | 变更 |
+|---|---|---|
+| v18 | 2026-11-03 | 基线：boot_completed 触发、adbd 只 start 不 stop |
+| v19 | 2026-11-10 | 16 秒快速失败 + 强制 `sys.usb.config adb`（**已被 v20 否定**） |
+| v19b | 2026-11-10 | 改用 `mtp,diag,adb`（A 类规则，能重建但会让 Windows 多出 MTP/COM 口） |
+| **v20** | **2026-11-11** | **彻底移除 `sys.usb.config`，改为 configfs 直接重建 gadget；无线 adb 提前设置；90s→20s 等待；遇 stopping 明确不干预** |
