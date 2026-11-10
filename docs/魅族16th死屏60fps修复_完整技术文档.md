@@ -826,3 +826,164 @@ V38（恢复卡顿）→ V39（GPU死锁）→ V40（黑屏）→ V41（overflow
 - **测量方法本身必须先被验证**。本轮最大的坑是我用了一个与观感无关的计数器当作帧率，
   导致连续多个版本"测试通过"实际是黑屏。
 - 任何"我这边正常"的结论，必须同时给出 **截图非黑 + scrcpy 实际帧率 + 内核零错误** 三项证据。
+
+---
+
+## 13. ★ V53 最终修复（2026-11-10 晚）
+
+> **最终定版：V53**｜md5 `f26c9525cacf934b17f74d9ac96ba874`
+>
+> 实测：长时间使用丝滑，内核 `sde error` 数为 **0**。
+
+### 13.1 V50 失败：fence 永不阻塞（方案 A）
+
+把 `sde_fence_signaled()`（sde_fence.c:126）改成永远 `return true`：
+
+```
+0x59BCE8: stp x29,x30  →  mov w0,#1 ; ret
+```
+
+效果：SF 从 `adreno_drawctxt_wait` 变成 `R`（Running），不再阻塞。但
+`prepare_commit` 的 retire 队列仍然每 100ms 溢出一次，最终系统彻底停止响应（看门狗重启）。
+**结论：消除等待不等于消除队列卡死。**
+
+### 13.2 V51 失败：自旋锁自死锁 → 无限重启（关键教训）
+
+思路：不再手写逻辑，改为调用驱动自己的
+`sde_encoder_phys_cmd_pp_tx_done_irq()`（0x568BC0）。
+
+**结果：第一帧就死锁，无限重启。** 用源码证实了原因：
+
+```c
+/* sde_encoder.c:3603-3647  sde_encoder_kickoff() */
+spin_lock_irqsave(&sde_enc->enc_spinlock, lock_flags);
+    ...
+    _sde_encoder_trigger_start(sde_enc->cur_master);   /* ← 我们的 hook 在这里 */
+    ...
+spin_unlock_irqrestore(&sde_enc->enc_spinlock, lock_flags);
+
+/* sde_encoder.c:4783 */  phys_params.enc_spinlock = &sde_enc->enc_spinlock;
+/* sapphire_phys_cmd.c:1452 */ phys_enc->enc_spinlock = p->enc_spinlock;
+```
+
+`pp_tx_done_irq` 内部要 `spin_lock_irqsave(phys_enc->enc_spinlock, ...)`——**与 kickoff
+持有的是同一把非递归自旋锁**，因此在 hook 点调用它必然自死锁。
+
+> **教训：改内核之前必须先确认调用点的锁状态。**
+
+### 13.3 V52：代码洞语义修正（真正的进步）
+
+不改调用位置，而是把驱动 `pp_tx_done_irq` 的**守卫语义**内联进代码洞
+（此时锁已由 kickoff 持有，无需重复获取）：
+
+```
+/* 代码洞 0x566864，33 条指令 */
+mov  x19, x0                       // phys_enc
+add  x5, x19, #0x294               // &pending_retire_fence_cnt
+ldaxr w6,[x5]; cbz w6, skip; sub w6,w6,#1; stxr w7,w6,[x5]; cbnz w7,retry
+    → frame_done(SIGNAL_RETIRE_FENCE=0x1)
+skip:
+add  x5, x19, #0x28C               // &pending_ctlstart_cnt
+ldaxr w6,[x5]; cbz w6, skip2; sub w6,w6,#1; stxr w7,w6,[x5]; cbnz w7,retry
+skip2:
+    → frame_done(DONE|SIGNAL_RELEASE_FENCE = 0x18)
+add  x5, x19, #0x290               // &pending_kickoff_cnt
+ldaxr w6,[x5]; cbz w6, done; sub w6,w6,#1; stxr w7,w6,[x5]; cbnz w7,retry
+done: ret
+```
+
+**与旧版（V38~V46）的本质区别**：旧版是**无条件**发事件，导致账目错位
+（漏记/多记/队列不释放）；新版每一步都受 `atomic_add_unless(…,-1,0)` 守卫——
+**计数器为 0 时什么都不做**，这正是驱动 `pp_tx_done_irq` 的写法。
+
+效果：`retire event overflow` / `without kickoff` / `syncpoint deadlock` / `ctl start`
+全部归零。
+
+### 13.4 V52 残留故障：我自己埋的坑
+
+V52 启动正常，但使用后重启。dmesg：
+
+```
+failed to enable clk control -16 (EBUSY)
+enc25 sw_event:1, rc in state 4            ← 状态机在 IDLE(4) 收到非法事件
+enc25 resource kickoff failed rc -16
+VBIF 0 client 12 not halting. TIMEDOUT.    ← 硬件停不下来
+```
+
+**根因是 V47 引入的两个"撒谎"补丁**：为了让转场不卡 84ms，曾把
+
+```
+0x56A5F4  _sde_encoder_phys_cmd_wait_for_idle   → mov w0,#0 ; ret
+0x56A0F8  sde_encoder_phys_cmd_wait_for_vblank  → mov w0,#0 ; ret
+```
+
+改成直接返回成功。这让资源控制状态机以为硬件已空闲，**提前进入 IDLE 态**
+（enum: `OFF=0, PRE_OFF=1, ON=2, MODESET=3, IDLE=4`），之后 KICKOFF 撞 EBUSY、
+VBIF 无法 halt。
+
+而这两个谎在 V52 之后**已无必要**：代码洞在 kickoff 时就把 `pending_kickoff_cnt`
+递减到 0，真实的 `wait_for_idle` 会立即返回 0。
+
+### 13.5 V53 定版
+
+在 V52 基础上，**按原厂镜像完整恢复**上述两个函数（注意：必须恢复**两条**指令，
+只恢复第一条会留下 `ret`，造成栈不平衡而崩溃）：
+
+```
+0x56A5F4: d101c3ff a9017bfd   (sub sp,sp,#0x70 ; stp x29,x30,[sp,#16])
+0x56A0F8: a9bd7bfd 910003fd   (stp x29,x30,[sp,#-0x30]! ; add x29,sp,#0)
+```
+
+### 13.6 V53 验收
+
+| 项目 | 结果 |
+|---|---|
+| `sde error`（本次开机全部） | **0** |
+| retire event overflow | **0** |
+| retire event without kickoff | **0** |
+| GPU syncpoint deadlock | **0** |
+| ctl_start 超时 | **0** |
+| resource kickoff failed / clk control / VBIF not halting | **0** |
+| PANEL_DEAD / timeline reset / esd check failed | **0** |
+| DRM vblank | **58~60 fps** |
+| 截图画面 | **968/968 采样点非黑** |
+| 实际使用 | **丝滑，长时间无异常** |
+
+### 13.7 V53 权威补丁清单（镜像 diff 生成）
+
+| # | 地址 | 原厂 | V53 | 作用 |
+|---|---|---|---|---|
+| 1 | `0x55E478` | `3940C6A4` | `52800024` | vsync 源强制改 MDP 看门狗定时器 |
+| 2 | `0x566864`~`0x5668E3` | — | 33 条指令 | **代码洞：守卫式完成逻辑**（覆盖 `_sde_encoder_phys_vid_wait_for_vblank`，video 模式专用，command 模式永不执行） |
+| 3 | `0x56A0E8` | `97FFD76C` | `97FFF1DF` | `trigger_start` 中 `bl` 到代码洞 |
+| 4 | `0x56A83C` | `52800081` | `52800061` | enable_state 4→3 |
+| 5 | `0x56A94C` | `528001C2` | `52800142` | 抑制 PANEL_DEAD 事件位 |
+| 6 | `0x56AE64` | `12800DB4` | `52800014` | ctl_start 超时返回 0，commit 继续 |
+| 7 | `0x584350` | `A9BD7BFD` | `D65F03C0` | `_sde_connector_report_panel_dead` → `ret` |
+| 8 | `0x5854CC` | `A9B87BFD` | `D65F03C0` | `sde_connector_schedule_status_work` → `ret`（ESD 检查永不调度） |
+
+> 另：`0x566900`~`0x566957` 残留 V46 实验期代码（现已无跳转指向，属死代码，
+> 位于永不执行的 video 模式函数空间内，无副作用）。
+
+**已恢复原厂**（不再需要）：`0x56A5F4` / `0x56A0F8`（真实等待）、`0x56ACBC`、
+`0x51B840`（vblank 常开）、`0x59BCE8`（fence 永不阻塞）。
+
+### 13.8 版本终局
+
+```
+V38(恢复卡顿) → V39(GPU死锁) → V40(黑屏) → V41(overflow) → V42(双重retire)
+→ V43(ESD未修) → V44(从未工作) → V45(定位ESD真根因) → V46(漏retire)
+→ V47(谎报idle埋坑) → V48(vblank常开致溢出) → V49(autorefresh补过头)
+→ V50(fence永不阻塞) → V51(自旋锁自死锁/无限重启)
+→ V52(守卫式代码洞，残留状态机错误) → V53(★ 定版：零错误，丝滑)
+```
+
+### 13.9 本轮核心教训
+
+1. **测量方法必须先被验证**。用 vsync 计数器当帧率，导致多个版本"测试通过"实为黑屏。
+2. **改内核前先确认调用点的锁状态**。V51 在持锁区调用会再次取同一把锁 → 自死锁。
+3. **不要对状态机撒谎**。把 `wait_for_idle` 改成恒返回 0，会让资源控制提前进 IDLE，
+   后续 KICKOFF 撞 EBUSY、VBIF 无法 halt。
+4. **伪造事件必须带守卫**。`atomic_add_unless(…,-1,0)` 的语义是"计数器为 0 就什么都不做"，
+   无条件发事件必然导致记账错位。
+5. **恢复补丁时要恢复完整指令组**。只恢复首条会留下 `ret`，造成栈不平衡。
