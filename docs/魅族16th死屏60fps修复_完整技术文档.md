@@ -1102,3 +1102,49 @@ chmod 0755 /sys/kernel/debug
    正常网页通常 >500 种颜色。这是无 GUI 环境下判断"是否白屏"的实用手段。
 4. **改系统行为时优先查 init 的预期值**（`init.rc` / `init.*.rc` 里的 `chmod` / `mkdir`），
    破坏它的前提是有充分理由。
+
+---
+
+## 15. 附：USB adb 在热重启后失效（2026-11-10 晚）
+
+> 与 60fps 修复无关，但同属死屏设备的可用性关键问题。
+> 完整分析见 `adb开机自愈方案.md` 第九章。
+
+### 15.1 一句话结论
+
+ROM 的 `/vendor/etc/init/hw/init.msm.usb.configfs.rc` 里，
+`sys.usb.config=adb` 和 `=mtp,adb` 两条规则**只写 VID/PID，不构建 gadget**
+（不清空 f1~f9、不 symlink `ffs.adb`、不绑 UDC）。真正构建 gadget 的规则
+都要求 `sys.usb.ffs.ready=1` 且属于其它组合（`mtp,diag,adb`、`diag,adb` 等）。
+
+所以 `setprop sys.usb.config adb` 在 gadget 有残留功能时，会得到
+"PID 声称 adb、实际只有 MTP"的状态 → 主机看不到 adb，而 adbd 进程依然健康。
+
+### 15.2 冷启动 vs 热重启
+
+- 冷启动：gadget 从零构建，框架会把 f1 正确设为 `ffs.adb` → 可用
+- 热重启：gadget 保留上次内容（如 `mtp.gs0`），只改 PID → **adb 失效**
+
+### 15.3 修复
+
+脚本里的裸 `adb` 改为 `mtp,diag,adb`：
+
+```
+/data/local/adbfix.sh:107   setprop sys.usb.config mtp,diag,adb
+/data/local/usbfix.sh:66    setprop sys.usb.config mtp,diag,adb
+```
+
+该组合有完整构建规则，会先 `rm f1..f9` 再重建，天然干净。
+
+### 15.4 排查要点
+
+**永远不要相信 `sys.usb.config` / `sys.usb.state`**，权威来源是：
+
+```bash
+adb shell 'ls -l /config/usb_gadget/g1/configs/b.1/ | grep "^l"'
+# 必须看到 ffs.adb 的 symlink，否则 ADB 接口不存在
+
+adb shell 'cat /config/usb_gadget/g1/idProduct'
+# 0x0C01 / 0x0C02 = 走了"只改PID"的危险规则
+# 0x903A        = mtp,diag,adb 的完整重建规则（安全）
+```
