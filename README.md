@@ -134,18 +134,52 @@ adb shell 'cat /sys/kernel/debug/dri/0/crtc111/status | grep "vblank fps"'   # 5
 
 ```
 README.md
-docs/魅族16th死屏60fps修复_完整技术文档.md   ← 13 章完整技术文档
-docs/尝试追踪链.md                            ← 42 节逐版本调试史（V3~V53）
+docs/魅族16th死屏60fps修复_完整技术文档.md   ← 14 章完整技术文档（含排错附录）
+docs/尝试追踪链.md                            ← 43 节逐版本调试史（V3~V53）
 docs/目录结构说明.md
 patch/patch_v38.py                            ← 早期补丁生成脚本（历史参考）
-scripts/esdfix.sh                             ← ESD 检查模式脚本（可选，双保险）
 images/boot_v53.img                           ← ★ 最终可刷镜像
 images/Image_v53.img                          ← 最终内核 Image
 ```
 
 ---
 
-## 八、免责声明
+#---
+
+## 八、常见问题
+
+### Q1. 浏览器能上网但打不开网页 / 直接闪退
+
+**不是网络问题。** 检查是不是 `/sys/kernel/debug` 的权限被改坏了：
+
+```bash
+adb shell ls -ld /sys/kernel/debug
+# 正确应为 drwxr-xr-x (0755)，即 init.qcom.rc 里 chmod 0755 的设定
+# 若为 drwx------ (0700)：WebView 渲染进程必然崩溃
+adb shell 'logcat -d | grep "Abort message"'   # 会看到 trace_marker Permission denied
+adb shell su -c "chmod 0755 /sys/kernel/debug"
+```
+
+**根源**：任何对 `/sys/kernel/debug` 执行 `mount -o rw,remount` 的操作，都会把
+debugfs 根目录权限重置为内核默认的 `0700`。随后 zygote fork WebView 渲染进程时，
+需要按子进程 uid 重新 open 已继承的 `/sys/kernel/debug/tracing/trace_marker`，
+0700 导致 EACCES → Android 视为致命错误（`JNI FatalError`）→ abort →
+渲染进程建不起来 → 浏览器白屏/闪退。
+
+> 因此：**不要 remount debugfs**。本方案不需要任何额外开机脚本。
+
+### Q2. 误杀了 `webview_zygote` 怎么办
+
+它**不是 init 服务**，是主 zygote 按需 fork 的子 zygote。`kill -9` 之后
+`start webview_zygote` 无效、init 不会重启它、框架 socket 缓存也已失效 ——
+**只能重启设备**。重启后再 `am force-stop` 一次浏览器进程清掉残留状态。
+
+### Q3. 判断"是不是白屏"
+
+无 GUI 时可截图做颜色统计：整屏纯白占比 >90%、颜色种类 <200 基本可断定没渲染出来；
+正常网页通常 >500 种颜色。
+
+# 九、免责声明
 
 - 仅针对**屏幕已物理损坏**、已解锁引导、已 root 的设备。正常设备无需也无益。
 - 刷写 boot 分区有风险，请先备份原厂 `boot.img` / `dtbo`，确认能进 TWRP。

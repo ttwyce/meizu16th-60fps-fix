@@ -987,3 +987,118 @@ V38(恢复卡顿) → V39(GPU死锁) → V40(黑屏) → V41(overflow) → V42(�
 4. **伪造事件必须带守卫**。`atomic_add_unless(…,-1,0)` 的语义是"计数器为 0 就什么都不做"，
    无条件发事件必然导致记账错位。
 5. **恢复补丁时要恢复完整指令组**。只恢复首条会留下 `ret`，造成栈不平衡。
+
+---
+
+## 14. 附：一次由调试脚本引发的 WebView 故障（2026-11-10 晚）
+
+> 与 60fps 修复无关，但**是本次调试过程中自己造成的**，记录以免重犯。
+> 症状：浏览器能上网但打不开网页 → 后发展为直接闪退。
+
+### 14.1 症状与初步误判
+
+- 设备网络正常（`ping` 通、`curl https://www.baidu.com` 返回 **HTTP 200 / 0.17s**）
+- DNS 正常（当时 FlClash 在 fake-ip 模式，返回 `198.18.0.23`；关闭后返回真实 IP `110.242.69.21`）
+- 但浏览器白屏、随后闪退
+
+**容易误判为网络/代理问题，实际与网络无关。**
+
+### 14.2 真正的崩溃原因
+
+logcat 中的致命信息：
+
+```
+F DEBUG : Abort message: 'JNI FatalError called: (zygote) Failed open(
+            /sys/kernel/debug/tracing/trace_marker, 1): Permission denied'
+F DEBUG : name: webview_zygote  >>> webview_zygote <<<
+
+backtrace:
+  #03 art::JNI::FatalError
+  #04 ZygoteFailure
+  #05 FileDescriptorInfo::ReopenOrDetach
+  #06 FileDescriptorTable::ReopenOrDetach
+  #07 ForkCommon
+  #08 Zygote.nativeForkAndSpecialize
+  #22 ZygoteConnection.processOneCommand
+  #43 WebViewZygoteInit.main
+```
+
+配合 `ActivityManager: com.android.webview:sandboxed_process1 failed to attach` /
+`Killing … : start timeout`——**WebView 渲染进程从未成功创建**，所以浏览器必然白屏或闪退。
+
+### 14.3 因果链
+
+```
+zygote 启动时持有 /sys/kernel/debug/tracing/trace_marker 的 fd
+        ↓
+webview_zygote 从 zygote fork，继承该 fd
+        ↓
+它再 fork 渲染进程时，Zygote 的 FileDescriptorTable::ReopenOrDetach
+会以「子进程 uid」重新 open() 这个 fd（这是 Android 的 fd 卫生机制）
+        ↓
+但 /sys/kernel/debug 的目录权限是 0700 root
+        ↓
+非 root 的沙箱 uid 无法穿越目录 → open() 返回 EACCES
+        ↓
+Android 将 fd 重开失败视为致命错误 → JNI FatalError → abort()
+        ↓
+渲染进程无法创建 → 浏览器打不开网页 / 闪退
+```
+
+### 14.4 元凶：一条多余的 remount
+
+```
+esdfix.sh:8:  mount -o rw,remount /sys/kernel/debug
+```
+
+**remount 会把 debugfs 根目录权限重置为内核默认值 0700**，而
+`init.qcom.rc:37` 明确设定的是：
+
+```
+chmod 0755 /sys/kernel/debug
+```
+
+所以在 17:12 加入该脚本之前浏览器一切正常，加入之后每次开机 WebView 必崩。
+
+> 注意：`/sys/kernel/debug/tracing` 本身是 0755（`init.rc:421`），
+> 被卡住的是**上层 `/sys/kernel/debug` 的穿越权限**。
+
+### 14.5 修复
+
+1. **删除 `esdfix.sh`**——V45 起 ESD 已在内核层彻底禁用
+   （`0x5854CC` / `0x584350` 两处直接 `ret`），该脚本本就多余
+2. 恢复权限：`chmod 0755 /sys/kernel/debug`
+3. **重启**（见 14.6）
+4. 强制重启浏览器进程，清掉失效状态
+
+### 14.6 附带教训：不要 kill `webview_zygote`
+
+它**不是 init 的服务**（`getprop init.svc.webview_zygote` 为空），
+而是由主 zygote 按需 fork 的子 zygote，框架侧缓存着 socket。
+`kill -9` 之后：
+
+- `start webview_zygote` 无效
+- init 不会重启它
+- 框架不再重新 fork（socket 缓存已失效）
+
+**唯一恢复方式：重启设备。**
+
+### 14.7 验证
+
+| 项目 | 结果 |
+|---|---|
+| webview_zygote 崩溃 | **0** |
+| 渲染进程 | **2 个（正常创建）** |
+| `net::ERR` / `failed to attach` | **0** |
+| 页面渲染 | 截图颜色数 **888**、纯白仅 **3.1%**（正常网页特征） |
+| `/sys/kernel/debug` | `drwxr-xr-x` ✓ |
+| 显示内核 V53 | `sde_error=0` / `overflow=0` / `deadlock=0` |
+
+### 14.8 排查方法论
+
+1. **先分层定位**：网络层（ping / curl / DNS）→ 应用层（logcat 崩溃栈）。本次网络层全部正常，问题在应用层。
+2. **`F DEBUG` / `Abort message` 是最直接的线索**，比猜测有效得多。
+3. **颜色多样性判断渲染**：整屏纯白占比 >90%、颜色数 <200 基本可断定"没渲染出来"，
+   正常网页通常 >500 种颜色。这是无 GUI 环境下判断"是否白屏"的实用手段。
+4. **改系统行为时优先查 init 的预期值**（`init.rc` / `init.*.rc` 里的 `chmod` / `mkdir`），
+   破坏它的前提是有充分理由。
