@@ -715,3 +715,114 @@ plane92 9999ms timeout on kgsl-timeline
 V38（恢复卡顿）→ V39（GPU 死锁，废）→ V40（黑屏，废）
 → V41（0fps 溢出）→ V42（浏览器 GPU 死锁）→ V43（★ 最终定版）
 ```
+
+---
+
+## 12. ★ V45 最终修复：真正的根因是 ESD 检测（2026-11-10 傍晚）
+
+> **最终定版：V45**｜md5 `565d5a9e78fca3b16661ef73a3a219e1`
+
+### 12.1 ⚠️ 必须先承认的测量错误（贯穿 V38~V44）
+
+之前所有"60fps"读数都来自：
+
+```bash
+cat /sys/kernel/debug/dri/0/encoder25/status   # vsync 计数
+```
+
+**这个计数器由看门狗定时器以 60Hz 独立驱动，与画面是否真的合成无关。**
+面板坏了、屏幕全黑时，它照样显示 60。因此出现了"我报 60fps、用户看到黑屏 0fps"的矛盾。
+
+**正确测量方法（缺一不可）**：
+
+| 指标 | 命令 | 说明 |
+|---|---|---|
+| 真实帧率 | `scrcpy --print-fps` | 实际编码/传输帧率，最接近人眼观感 |
+| 画面内容 | `screencap -p /sdcard/x.png` + 像素采样 | **判断是否黑屏的唯一可靠手段** |
+| 内核错误 | `dmesg \| grep -c ...` | PANEL_DEAD / timeline reset / ctl start |
+
+**教训**：vsync 计数在"用看门狗伪造 vsync"的方案里完全失去测量意义。
+
+### 12.2 V44 失败
+
+V44 = V43 + ctl_start 超时后补发 retire。刷入后**从未做过真实帧率测量**（只看了 vsync 计数），
+实际从启动就黑屏。排查确认：`vblank_enable=0`、截图全黑（14050 字节纯黑 PNG）、scrcpy 0fps。
+
+### 12.3 ★ 真正的根因：ESD 检测失败 → PANEL_DEAD → fence 时间线重置
+
+杀 SF 强制冷启动后，dmesg 暴露了关键错误：
+
+```
+[drm:_sde_connector_report_panel_dead:1760] esd check failed report PANEL_DEAD conn_id: 26 enc_id: 25
+[sde error]timeline reset attempt! done count:3175 commit:3178
+```
+
+**完整链条**：
+
+```
+1. 面板物理损坏 → DCS 寄存器读（ESD reg_read 模式）必然超时
+2. sde_connector_check_status_work() 检测失败（rc <= 0）
+3. → _sde_connector_report_panel_dead()
+4. → msm_mode_object_event_notify(DRM_EVENT_PANEL_DEAD)
+5. → sde_encoder_display_failure_notification()
+6. → 显示管线重启 + fence timeline reset
+7. → GPU 在等的 fence 序号被清零 → syncpoint deadlock
+8. → vblank 被关闭 → SF 停止合成 → 黑屏 / 0fps
+```
+
+**这解释了 V38~V44 全部"用几分钟/几十分钟后变黑"的现象**——不是补丁退化，而是 ESD 每隔
+`STATUS_CHECK_INTERVAL_MS` 就拆一次台。
+
+**尝试过但无效**：debugfs `esd_check_mode` 改 `te_signal_check`（坏屏 TE 也不可靠，仍失败）、
+`err_fg_gpio`（同样依赖面板反馈）。**坏屏下任何 ESD 检测模式都必然失败，只能彻底禁用。**
+
+### 12.4 V45 修复（2 条指令）
+
+```
+0x5854CC: sde_connector_schedule_status_work → ret (0xD65F03C0)
+          ESD 状态检查永不调度，从源头消除 PANEL_DEAD
+0x584350: _sde_connector_report_panel_dead   → ret (0xD65F03C0)
+          双保险：即使被调用也直接返回
+```
+
+配套 Magisk 持久脚本 `/data/adb/service.d/esdfix.sh`（等 debugfs 节点出现后写入
+`te_signal_check`，作为第三层保险）。
+
+### 12.5 实测结果（全部使用真实指标）
+
+| 项目 | 结果 |
+|---|---|
+| 截图内容 | **968/968 采样点非黑 ✓ 有画面** |
+| PANEL_DEAD | **0** |
+| timeline reset | **0** |
+| ctl_start 超时 | **0** |
+| GPU syncpoint deadlock | **0** |
+| retire event overflow | **0** |
+| 连续运行 | **420 秒（7 分钟）零错误** |
+| 快速滚动帧率 | 峰值 **60~66fps**，平均 ~40-50（含手势间隙造成的 SF 空闲） |
+
+### 12.6 V45 完整补丁清单（6 处）
+
+| # | 地址 | 改动 | 作用 |
+|---|---|---|---|
+| 1 | `0x56A94C` / `0x56A83C` | V20 两点 | 抑制 PANEL_DEAD 事件位 / 防降级 |
+| 2 | `0x55E478` | `ldrb→mov w4,#1` | vsync 源改 MDP 看门狗定时器 |
+| 3 | `0x566864`+`0x56A0E8` | 代码洞 | 合成 frame_done(0x9) + 递减 kickoff |
+| 4 | `0x56AE64` | `movn #-110 → movz #0` | ctl_start 超时后 commit 继续 |
+| 5 | `0x5854CC` | `stp → ret` | **ESD 检查永不调度（本轮核心）** |
+| 6 | `0x584350` | `stp → ret` | **PANEL_DEAD 上报永不执行（本轮核心）** |
+
+### 12.7 版本链与结论
+
+```
+V38（恢复卡顿）→ V39（GPU死锁）→ V40（黑屏）→ V41（overflow）
+→ V42（双重retire）→ V43（ESD未修，会渐变黑）→ V44（从未真正工作）
+→ V45（★ 定位 ESD 真根因，彻底禁用，画面正常、零错误）
+```
+
+**根本教训**：
+- 坏屏设备的故障是**多因叠加**：vsync 源、ctl_start、kickoff 计数、retire 记账、**ESD 检测**，
+  必须逐一定位，缺一不可。
+- **测量方法本身必须先被验证**。本轮最大的坑是我用了一个与观感无关的计数器当作帧率，
+  导致连续多个版本"测试通过"实际是黑屏。
+- 任何"我这边正常"的结论，必须同时给出 **截图非黑 + scrcpy 实际帧率 + 内核零错误** 三项证据。
