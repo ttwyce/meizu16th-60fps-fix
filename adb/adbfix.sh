@@ -104,7 +104,7 @@ if [ "$(getprop init.svc.adbd)" != "running" ] \
   log "adbd not running (not stopping) -> one-shot configfs nudge"
   setprop sys.usb.ffs.ready 1
   sleep 1
-  setprop sys.usb.config adb
+  setprop sys.usb.config mtp,diag,adb
   sleep 4
   log "after nudge: adbd=$(getprop init.svc.adbd) usb=$(getprop sys.usb.state)"
 fi
