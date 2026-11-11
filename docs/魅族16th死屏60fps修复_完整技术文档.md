@@ -1148,3 +1148,141 @@ adb shell 'cat /config/usb_gadget/g1/idProduct'
 # 0x0C01 / 0x0C02 = 走了"只改PID"的危险规则
 # 0x903A        = mtp,diag,adb 的完整重建规则（安全）
 ```
+
+> **⚠️ 第 15 章的方案已被推翻（2026-11-11 更新）**：
+> 15.3 推荐的 `setprop sys.usb.config mtp,diag,adb` 虽然能重建 gadget，
+> 但实测会触发 adbd 进入 `stopping` 死锁，且 Windows 会多出 MTP + COM 口。
+> **正确做法是直接操作 configfs 重建 gadget（v20）**，见第 16 章。
+
+---
+
+## 16. ★ 2026-11-11：USB adb 根治 + 无线 adb + GSI 兼容性实测
+
+### 16.1 USB adb 失效的根治方案（v20）
+
+第 15 章找到了"B 类规则不清功能"的证据，本章给出不依赖任何属性组合的根治方案。
+
+**问题**：`sys.usb.config=adb` 走的规则只写 idVendor/idProduct（0x2A45/0x0C01），
+不清空 f1~f9、不 symlink `ffs.adb`、不绑 UDC。冷启动时 gadget 先被配成 MTP，
+于是出现"PID 声称 adb、实际只有 MTP"的错位状态，主机看不到 ADB 设备。
+
+**修复：直接操作 configfs（无需重启）**
+
+```bash
+GB=/config/usb_gadget/g1
+UDC=$(ls /sys/class/udc | head -1)
+echo "" > $GB/UDC                                        # 断开
+sleep 1
+rm -f $GB/configs/b.1/f1 $GB/configs/b.1/f2 $GB/configs/b.1/f3
+ln -s $GB/functions/ffs.adb $GB/configs/b.1/f1           # 链上 ADB
+echo 0x2a45 > $GB/idVendor
+echo 0x0c01 > $GB/idProduct
+setprop sys.usb.ffs.ready 1
+sleep 1
+echo "$UDC" > $GB/UDC                                    # 重新挂上
+```
+
+实测：修复前 `f1 -> mtp.gs0`（`adb devices` 空），修复后 `f1 -> ffs.adb`，
+主机**立刻**枚举到设备。
+
+`adb/adbfix.sh`(v20) 与 `adb/usbfix.sh`(v3) 已内置该逻辑（`fix_gadget()`），
+并把所有 `setprop sys.usb.config` 从脚本中彻底移除。
+
+### 16.2 三条禁令（都踩过坑）
+
+| 禁令 | 后果 |
+|---|---|
+| 绝不 `stop adbd` | adbd 卡内核 D 状态，`init.svc.adbd=stopping` 永久，只能重启 |
+| 绝不 `setprop sys.usb.config <任意值>` | init 重建 USB 配置 → adbd 被 stop/start → 本机必卡 stopping |
+| 绝不快速切换 `adb_enabled` 1→0→1 | 框架重启 adbd，同上 |
+
+adbd 没跑时唯一正确的动作：`setprop ctl.start adbd`，再用 `fix_gadget()` 补 gadget。
+
+### 16.3 无线 adb
+
+需要两个属性：
+
+```bash
+setprop persist.adb.tcp.port 5555      # 持久，存于 /data/property/persistent_properties
+setprop service.adb.tcp.port 5555      # 运行时，adbd 据此监听 TCP
+adb connect <手机IP>:5555
+```
+
+**关键认知**：adbd 监听 `0.0.0.0:5555` 与 `wlan0` 有无 IP **无关**，
+所以不要等 WiFi 拿到地址再设端口。
+
+**启动慢的真正原因**：原 adbfix 在 `boot_completed` 后死等 `adbd=running` 最多 90 秒，
+而 `adb_enabled=0` 时框架根本不会拉起 adbd，于是白等满 90 秒。v20 把无线 adb
+段落提到等待之前、等待 90s→20s，实测：
+
+```
+18:01:20  adbfix 启动
+18:01:26  adb_enabled 0 -> 1 + set service.adb.tcp.port=5555
+18:01:28  adbd running, f1=ffs.adb
+18:01:28  全部就绪            ← 从启动到双通道可用：8 秒（原 92 秒）
+```
+
+### 16.4 GSI 兼容性：三次尝试全部失败
+
+| GSI | 版本 | 卡点 |
+|---|---|---|
+| LineageOS 18.1 `arm64_bvS` | Android 11 / API 30 | vendor `plat_sepolicy_vers=29.0` 与 API 30 不匹配 → 303 次 `no domain transition`，vendor HAL 全被拒 |
+| LineageOS 17.1 `treble_arm64_bvS` | Android 10 / API 29 | SELinux permissive 不阻塞，SF 能起，但 `vendor.hwcomposer-2-1` 每次 `exit(1)` |
+| PHH AOSP v222 `arm64-ab` | Android 10 / API 29 | 同上，崩溃服务清单完全一致 |
+
+**共同死因链**：
+
+```
+vendor.hwcomposer-2-1 启动 ~145ms exit(1)
+  → rc 含 onrestart restart surfaceflinger → init SIGKILL SurfaceFlinger
+  → SF 起不来 → system_server 起不来 → boot_completed 永远 0
+  → 无 adbd / USB 不枚举 → 回落 TWRP
+```
+
+**结论**：魅族 vendor 的 HWC 2.1 实现拒绝在非魅族 system 上加载。
+GSI 这条路对本机不可行，必须给 vendor 二进制打补丁。
+
+### 16.5 顺带修好的真 bug：pdx socket 目录缺失
+
+GSI 的 `/system/etc/init/surfaceflinger.rc` 声明：
+
+```
+socket pdx/system/vr/display/client   stream 0666 ...
+socket pdx/system/vr/display/manager  stream 0666 ...
+socket pdx/system/vr/display/vsync    stream 0666 ...
+```
+
+AOSP init 不创建中间目录，vendor 也没有对应 `mkdir`，于是：
+
+```
+init: Failed to bind socket 'pdx/system/vr/display/client': No such file or directory
+```
+
+在 vendor rc 的 `on early-init` 建好该目录后：
+
+```
+init: Created socket '/dev/socket/pdx/system/vr/display/client', mode 666 ...
+```
+
+**但修好后 composer 仍然 exit(1)** —— 证明 pdx 不是根因。
+
+### 16.6 设备分区与 GSI 选型参考
+
+```
+vendor   : Android 10 / SDK 29，plat_sepolicy_vers=29.0，非 VNDK vendor
+HAL      : keymaster 3.0、health 2.0、composer 2.1、allocator/mapper 2.0、audio 2.0
+分区     : A-only 单槽位；system=sda16(3GB ext4)、vendor=sda17(1GB ext4)、无 product
+布局     : system-as-root（/init -> /system/bin/init）
+GSI 变体 : 必须 system-as-root（AndyYan `b` / PHH `ab`），`aonly` 不适用
+刷入注意 : GSI 是 sparse image，必须 simg2img 转 raw 再 dd
+```
+
+### 16.7 `/data` 格式化的连带损失
+
+清 `/data` 会同时丢掉：`/data/misc/adb/adb_keys`、`/data/local/adbfix.sh`+`usbfix.sh`、
+`/data/property/persistent_properties`（含 `persist.adb.tcp.port`）、
+`/data/adb/modules/*`（Magisk 模块）、`/data/misc/wifi/WifiConfigStore.xml`（WiFi 密码）、
+以及 `/sdcard` 全部内容。
+
+> ⚠️ `mokee_color_profile` 被清空会导致 livedisplay HAL 崩 → watchdog 无限重启。
+> adbfix 第 1 段就是修这个，务必保留在最前面。
