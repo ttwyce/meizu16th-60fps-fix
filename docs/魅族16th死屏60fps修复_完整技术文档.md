@@ -1286,3 +1286,168 @@ GSI 变体 : 必须 system-as-root（AndyYan `b` / PHH `ab`），`aonly` 不适�
 
 > ⚠️ `mokee_color_profile` 被清空会导致 livedisplay HAL 崩 → watchdog 无限重启。
 > adbfix 第 1 段就是修这个，务必保留在最前面。
+---
+
+## 17. ★ 2026-11-11：移植到 Android 11（ShapeShiftOS）—— **DTB 才是关键**
+
+这一章记录把同一套显示补丁移植到第三方 Android 11 ROM（ShapeShiftOS 2.7, m1882）
+时踩的坑。**结论先行：真正卡了 20 多次刷机失败的，不是 AVB 校验，而是内核区末尾
+那 429 KB 追加 DTB 被我抹掉了。**
+
+### 17.1 背景
+
+```
+ROM      ShapeShiftOS-2.7-Solosis-UNOFFICIAL-m1882-20210906-1715.zip
+         Android 11 / RQ3A.210805.001.A1 / API 30 / post-sdk-level=30
+         自带 system(2.68GiB→3GB) + vendor(654MiB→1GB) + firmware-update 全套
+boot.img 12,591,104 字节  page_size=4096  kernel_size=11,745,083  ramdisk=835,981
+固件     随包刷入 XBL/ABL 2021-05（设备原有的是 2020-01）
+```
+
+未打补丁时系统能启动、能投屏，但帧率很差：
+
+```
+Settings 滑动 20 次     87 帧        ≈ 7.7 fps
+中位帧耗时              85 ms        (= 5.1 × 16.67ms vsync)
+Janky                   78%
+丢 vsync                49 次
+sde 错误                51 次
+```
+
+和 MoKee 死屏时的症状完全一致 —— 说明补丁仍然必要。
+
+### 17.2 现象：任何改过的 boot 都落到 fastboot
+
+把 V53 的 8 处补丁按 `+0x1A00` 偏移平移到 ROM 内核（7 个补丁点指令逐字节相同，
+BL 目标 `0x564BF0` 也同步平移，位置无关）后重组 boot.img → 刷入 → **fastboot**。
+原版 boot.img 刷入 → 正常启动。差异非常明确。
+
+### 17.3 一串被证伪的假设（走了很长的弯路）
+
+| # | 假设 | 验证方式 | 结果 |
+|---|---|---|---|
+| 1 | ROM 的 vbmeta 开启了签名校验 | 读 `flags` 字段 | ✗ 实为 `0x00000002`，VERIFICATION_DISABLED 已置位 |
+| 2 | `fastboot --disable-verification --disable-verity flash vbmeta` 可关校验 | 实刷 | ✗ 刷入成功，改过的 boot 仍被拒 |
+| 3 | 空 vbmeta（无描述符）能通吃 | 手搓 + 刷入 | ✗ 连原版内核都起不来 |
+| 4 | 空 vbmeta 但正确签名即可 | 用测试私钥重签（自校验通过） | ✗ 仍起不来 |
+| 5 | 删掉 boot 描述符即可 | 手工删 200 字节 + 重签 | ✗ 仍起不来 |
+| 6 | 标志位 0x2→0x3（恢复旧固件那种全关）即可 | 改 flags + 重签 | ✗ 仍失败 |
+| 7 | 内核体积变化导致 ramdisk 偏移错 | 同尺寸布局（内核区零填充补齐） | ✗ 仍失败 |
+| 8 | .NET GZipStream 的 gzip 不被接受 | 换 Python `gzip.compress(level=9, mtime=0)` | ✗ 仍失败 |
+| 9 | boot 头 `id[]`（SHA1）被校验 | 枚举 18 种公式 | ✗ 全部不匹配 |
+| 10 | 分区大小限制 | avbtool 提示 max image size | ✗ 与本问题无关 |
+
+### 17.4 关键实验：原版镜像改 1 个字节照样启动
+
+```
+取 ROM 原版 boot.img，把偏移 12,589,500（末尾零填充区）的 0x00 改成 0xA5
+→ 刷入 → 正常启动
+```
+
+**这一步直接推翻了"内容被哈希校验"的全部推论。** 校验对这块区域不生效，
+说明 ABL 并没有对 boot 做整体哈希比对 —— 之前所有失败都另有原因。
+
+> 附带情报：`fastboot oem device-info` 显示 `Verity mode: true`，但这个值
+> 反映的是熔丝/状态机，并不代表 boot 分区内容会被比对。
+
+### 17.5 真正的根因：内核区 = gzip **+ 追加 DTB**
+
+用 `zlib.decompressobj` 流式解压原始内核区，记录实际消耗的压缩字节数：
+
+```
+kernel region (kernel_size=11,745,083)
+  ├── gzip 内核流        11,315,905 字节   ← 解压后 32,915,464 字节
+  └── 追加 DTB              429,178 字节   ← 我每次都当成"零填充"抹掉了
+```
+
+DTB 开头是 `d0 0d fe ed`（FDT 魔数），内容：
+
+```
+Qualcomm Technologies, Inc. SDM845 v2.1 SoC
+qcom,sdm845 / arm,armv8 / l2-cache / l1-icache / cpu@100 ...
+```
+
+**没有设备树，内核无法初始化 SoC → 直接挂。** 这和校验、vbmeta、gzip 实现
+统统无关，纯粹是打包时把数据弄丢了。
+
+### 17.6 正确的重建方法
+
+要点只有三条：
+
+1. 先流式解压原始内核区，用 `len(region) - len(obj.unused_data)` 求出
+   **gzip 流的真实长度**
+2. 该长度之后的全部字节 = 追加 DTB，**原样保留**
+3. 新内核区 = `gzip(新内核) + DTB`，`kernel_size` 随之更新，ramdisk 顺移
+
+```python
+import gzip, struct, zlib
+
+b = open("boot.img", "rb").read()
+page = struct.unpack_from("<I", b, 36)[0]
+ks   = struct.unpack_from("<I", b,  8)[0]
+rs   = struct.unpack_from("<I", b, 16)[0]
+al   = lambda n, a=4096: (n + a - 1) // a * a
+
+region = b[page:page + ks]
+d = zlib.decompressobj(16 + zlib.MAX_WBITS)   # 16 = 带 gzip 头
+d.decompress(region); d.flush()
+consumed = len(region) - len(d.unused_data)
+dtb = region[consumed:]                        # ★ 关键：原样保留
+assert dtb[:4] == b"\xd0\x0d\xfe\xed"
+
+gz = gzip.compress(open("kernel_new.bin", "rb").read(), compresslevel=9, mtime=0)
+new_kernel = gz + dtb
+ramdisk_off = page + al(len(new_kernel), page)
+ramdisk = b[page + al(ks, page): page + al(ks, page) + rs]
+
+img = bytearray(page + al(len(new_kernel), page) + al(rs, page))
+img[0:page] = b[0:page]
+struct.pack_into("<I", img, 8, len(new_kernel))
+img[page:page + len(new_kernel)] = new_kernel
+img[ramdisk_off:ramdisk_off + rs] = ramdisk
+open("boot_new.img", "wb").write(img)
+```
+
+实测新内核区比原来大约 3 KB（gzip 压缩率差异），ramdisk 后移 1 页，
+**ABL 完全接受**——只要 DTB 在。
+
+### 17.7 结果
+
+```
+                         打补丁前        打补丁后
+渲染帧数（同测试窗口）        87           778
+平均帧率                   7.7 fps      48.4 fps
+中位帧耗时                  85 ms          6 ms
+90 分位帧耗时              350 ms          9 ms
+Janky 帧                    78%          0.64%
+丢 vsync                    49 次           1 次
+sde 错误（开机至今）          51             5
+```
+
+vsync 周期 16.67 ms，中位 6 ms 意味着余量充足，可稳定跑满 60 fps。
+
+### 17.8 教训
+
+1. **"改了就不启动" ≠ "被校验拒绝"**。先做"改 1 个无用字节"的对照实验，
+   5 分钟就能排除整条校验路线，我却在这上面耗了两小时。
+2. **解压之后要看"还剩多少字节没被消费"**。`unused_data` 里藏着真正的东西
+   （这里是 429 KB 的 DTB），只取解压结果就等于丢掉一半内核区。
+3. **QCOM 的 boot.img 内核区经常是 `Image.gz + dtb`**，不是单纯的 `Image.gz`。
+4. 每换一个 ROM，先做三件事：读 boot 头字段、流式解压算 DTB 起点、
+   用原版镜像做改 1 字节的对照实验。
+
+### 17.9 附：avbtool（本次实际没用上，但备查）
+
+排查过程中从 AOSP `platform/external/avb` 取到了 avbtool。注意两点：
+
+- `master` / `refs/heads/main` 路径返回 404，**必须用 tag**：
+  `https://android.googlesource.com/platform/external/avb/+/refs/tags/android-11.0.0_r48/avbtool?format=TEXT`
+- Android 11 及更早的 avbtool 是 Python 2，在 Python 3.12 下需做 6 处修补：
+  `'rab+'`→`'r+b'`、`pout` 需 decode、`magic` 需 `b'AVB0'`、
+  `release_string` pack 前需 `.encode()`、`'\0' * n`→`b'\0' * n`、
+  `str(bytearray(x))`→`bytes(...)`、`communicate(str(x))`→`communicate(bytes(x))`
+
+顺带确认：该 ROM 的 vbmeta 使用 **AOSP 公开测试密钥 `testkey_rsa4096`**
+（模数 `d804afe3d3846c7e...` 与 AOSP 完全一致），即任何人有能力为其重签。
+本次最终没用到这个机会。
+

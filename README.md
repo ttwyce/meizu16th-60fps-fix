@@ -4,6 +4,11 @@
 >
 > 面板物理损坏（DSI command mode）后系统只剩 2fps。通过 8 处内核二进制补丁，
 > 恢复桌面 60fps，**本次开机 `sde error` 数为 0**，实际使用丝滑。
+>
+> **2026-11-11 更新：同一套补丁已成功移植到第三方 Android 11（ShapeShiftOS 2.7）**，
+> 帧率 7.7 → 48.4fps、中位帧耗时 85ms → 6ms。
+> 移植过程中最重要的一条：**QCOM boot.img 的内核区是 `Image.gz + 追加 DTB`，
+> 重建时绝不能把 gzip 之后的字节清零**（详见 [技术文档 §17](docs/魅族16th死屏60fps修复_完整技术文档.md)）。
 
 ---
 
@@ -93,7 +98,7 @@ esd check failed report PANEL_DEAD (conn26/enc25)
 
 ---
 
-## 五、⚠️ 三条踩过的坑（给后来者）
+## 五、⚠️ 四条踩过的坑（给后来者）
 
 **① 不要用 vsync 计数器当帧率。**
 `/sys/kernel/debug/dri/0/encoder25/status` 的 vsync 计数由看门狗定时器独立驱动，
@@ -108,6 +113,25 @@ esd check failed report PANEL_DEAD (conn26/enc25)
 **③ 不要对资源控制状态机撒谎。**
 把 `wait_for_idle` 改成恒返回 0 会让它以为硬件已空闲、提前进入 IDLE 态，
 之后 KICKOFF 撞 `EBUSY`、VBIF 无法 halt（`not halting. TIMEDOUT`）。
+
+**④ 重建 boot.img 时不要把 gzip 之后的字节清零。**
+QCOM 的 boot.img 内核区经常是 **`Image.gz` + 追加 DTB**（本机：gzip 11,315,905 字节
++ DTB 429,178 字节，DTB 以 `d0 0d fe ed` 开头，内容为 "Qualcomm SDM845 v2.1 SoC"）。
+只保留解压结果、把内核区其余部分补零 → 内核没有设备树 → **必然起不来**，
+而现象和"被 AVB 校验拒绝"一模一样，极易误判。
+
+正确做法：
+
+```python
+d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+d.decompress(region); d.flush()
+consumed = len(region) - len(d.unused_data)   # gzip 流的真实长度
+dtb = region[consumed:]                       # ★ 原样保留
+new_kernel = gzip.compress(new_image, 9, mtime=0) + dtb
+```
+
+**排查口诀：看到"改了就不启动"，先拿原版镜像改一个无用字节试一次。**
+能启动就说明不是校验问题，去查打包丢数据；不能启动才去想 AVB。
 
 ---
 
