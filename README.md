@@ -144,7 +144,7 @@ adb shell 'cat /sys/kernel/debug/dri/0/crtc111/status | grep "vblank fps"'   # 5
         ↓
 /system/etc/adbfix.sh             ← 149 字节外壳，只做 exec
         ↓
-/data/local/adbfix.sh             ← 真正的逻辑（v18，改它不用动 /system）
+/data/local/adbfix.sh             ← 真正的逻辑（v20，改它不用动 /system）
         ↓
 /data/local/usbfix.sh --watch     ← USB gadget 自愈
 ```
@@ -161,6 +161,7 @@ adb shell '
   echo "adb_enabled = $(settings get global adb_enabled)" # 应为 1
   echo "adbd        = $(getprop init.svc.adbd)"           # 应为 running
   echo "usb.state   = $(getprop sys.usb.state)"           # 应为 adb
+  echo "gadget f1   = $(su -c 'readlink /config/usb_gadget/g1/configs/b.1/f1')"  # 应为 .../ffs.adb
 '
 ```
 
@@ -183,10 +184,10 @@ docs/adb开机自愈方案.md                       ← ADB 开机自愈方案�
 patch/patch_v38.py                            ← 早期补丁生成脚本（历史参考）
 scripts/fpslog.sh                              ← 可选：死屏调试日志工具（抓停滞现场）
 adb/zz-adbfix.rc                            ← init 触发器（三个触发条件）
-adb/mokee-adb.rc                            ← 无线 adb 规则（只 start 不 stop）
+adb/mokee-adb.rc                            ← 无线 adb 规则（只 start 不 stop，5555）
 adb/system_adbfix_wrapper.sh                  ← /system/etc/adbfix.sh 壳
-adb/adbfix.sh                               ← 主逻辑 v18（/data/local/）
-adb/usbfix.sh                              ← USB gadget 自愈（/data/local/）
+adb/adbfix.sh                               ← 主逻辑 v20（/data/local/）
+adb/usbfix.sh                              ← USB gadget 自愈 v3（/data/local/）
 images/boot_v53.img                           ← ★ 最终可刷镜像
 images/Image_v53.img                          ← 最终内核 Image
 ```
@@ -214,15 +215,31 @@ adb shell 'cat /config/usb_gadget/g1/idProduct'
 若 gadget 里残留着上次的 `mtp.gs0`，就会得到"PID 声称 adb、实际只有 MTP"的状态 ——
 主机看不到 adb，而 adbd 进程依然健康。
 
-**修复**：用有完整构建规则的组合（会先 `rm f1..f9` 再重建）：
+**修复（v20 起）**：不再依赖任何 `sys.usb.config` 组合，直接操作 configfs 重建：
 
 ```bash
-adb shell su -c 'setprop sys.usb.ffs.ready 1'
-adb shell su -c 'setprop sys.usb.config mtp,diag,adb'
+adb shell su -c '
+  GB=/config/usb_gadget/g1
+  UDC=$(ls /sys/class/udc | head -1)
+  echo "" > $GB/UDC
+  sleep 1
+  rm -f $GB/configs/b.1/f1 $GB/configs/b.1/f2 $GB/configs/b.1/f3
+  ln -s $GB/functions/ffs.adb $GB/configs/b.1/f1
+  echo 0x2a45 > $GB/idVendor
+  echo 0x0c01 > $GB/idProduct
+  setprop sys.usb.ffs.ready 1
+  sleep 1
+  echo "$UDC" > $GB/UDC
+'
 ```
 
-本仓库 `adb/adbfix.sh` 与 `adb/usbfix.sh` 已改用 `mtp,diag,adb`。
-详见 `docs/adb开机自愈方案.md` 第九章。
+**无需重启**，执行后主机立刻能枚举到 ADB 设备。
+
+本仓库 `adb/adbfix.sh`(v20) 与 `adb/usbfix.sh`(v3) 已内置该逻辑（`fix_gadget()`）。
+详见 `docs/adb开机自愈方案.md` 第十节。
+
+> ⚠️ v19 曾改用 `mtp,diag,adb`（A 类规则）—— 能用，但会让 Windows 多出 MTP + COM 口，
+> 且实测会触发 adbd 进入 `stopping` 死锁。v20 已彻底放弃该做法。
 
 > ⚠️ 永远不要用 `sys.usb.config` / `sys.usb.state` 属性判断 USB 是否正常 ——
 > 它们可能只反映"想配什么"。**权威来源是 configfs 里的 symlink。**
@@ -257,6 +274,36 @@ debugfs 根目录权限重置为内核默认的 `0700`。随后 zygote fork WebV
 
 无 GUI 时可截图做颜色统计：整屏纯白占比 >90%、颜色种类 <200 基本可断定没渲染出来；
 正常网页通常 >500 种颜色。
+
+### Q6. 能不能刷 Android 11 / 12 的 GSI，换个干净系统？
+
+**实测答案：不能。三个 GSI 全部卡在同一处（2026-11-10 ~ 11 实测）。**
+
+| GSI | 版本 | 结果 |
+|---|---|---|
+| LineageOS 18.1 `arm64_bvS` | Android 11 (API 30) | SELinux 域转换失败，所有 vendor HAL 被拒（303 次 `no domain transition`） |
+| LineageOS 17.1 `treble_arm64_bvS` | Android 10 (API 29) | SurfaceFlinger 能起，但 `vendor.hwcomposer-2-1` 每次 `exit(1)` |
+| PHH AOSP v222 `arm64-ab` | Android 10 (API 29) | 同上，崩溃服务清单完全一致 |
+
+**共同死因**：
+
+```
+vendor.hwcomposer-2-1 启动后 ~145ms exit(1)
+  → 它的 rc 含 onrestart restart surfaceflinger
+  → composer 每崩一次，init 就 SIGKILL SurfaceFlinger
+  → SF 永远起不来 → system_server 起不来
+  → sys.boot_completed 永远 0 → 无 adbd / USB 不枚举 → 回落 TWRP
+```
+
+**结论**：魅族 vendor 的 HWC 2.1 实现拒绝在非魅族 system 上加载。
+换 GSI 版本绕不过去，要解决必须给 vendor 二进制打补丁（数小时逆向工程）。
+
+顺带修好的一个真 bug：GSI 的 `surfaceflinger.rc` 声明了 3 个 `pdx/system/vr/display/*`
+socket，但没人建 `/dev/socket/pdx/system/vr/display` 目录 → `Failed to bind socket`。
+加 vendor rc 在 `on early-init` 建目录后 socket 创建成功 —— 但**修好后 composer 仍然崩**，
+所以那不是根因。详见 `docs/adb开机自愈方案.md` 第十三节。
+
+---
 
 ## 十、免责声明
 
